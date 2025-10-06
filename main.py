@@ -1,450 +1,379 @@
-# main.py
-# =========================================================
-# DOGE/USDT (BingX Perp) — Pro AI bot
-# - TV-matching entries (Range Filter)
-# - RSI / ADX / +DI / -DI / ATR
-# - Full Candlestick Intelligence after entry
-# - Smart Mgmt: TP1 + Breakeven + ATR-Trailing + Giveback
-# - Auto Scalp vs Trend modes
-# - Cumulative PnL sizing (next order grows with realized PnL)
-# - Clean iconic logs + /metrics + keepalive
-# =========================================================
+# ==========================================================
+# main.py — DOGE/USDT Smart AI Bot (FINAL)
+#  - TV-matching entries (Range Filter)
+#  - RSI / +DI / -DI / ADX / ATR
+#  - Full trade management: TP1 + Breakeven + ATR Trailing + Giveback
+#  - Scalp/Trend awareness via ADX and move strength
+#  - Cumulative PnL sizing (uses 60% equity by default)
+#  - Clean color logs + icons, 24/7 loop + keepalive
+# ==========================================================
 
-import os, time, math, json, threading, traceback, statistics as stats, logging
+import os, time, json, math, threading, traceback
 from datetime import datetime, timezone
-from termcolor import cprint, colored
 import pandas as pd
-from flask import Flask, jsonify
+from termcolor import cprint, colored
 import requests
 
-# ---------------- ENV ----------------
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY","")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET","")
+# ================= ENV =================
+BINGX_API_KEY     = os.getenv("BINGX_API_KEY","")
+BINGX_API_SECRET  = os.getenv("BINGX_API_SECRET","")
+SYMBOL            = os.getenv("SYMBOL","DOGE/USDT:USDT")
+INTERVAL          = os.getenv("INTERVAL","15m")
+LEVERAGE          = int(os.getenv("LEVERAGE","10"))
+RISK_ALLOC        = float(os.getenv("RISK_ALLOC","0.60"))  # 60% من الرصيد
+DECISION_EVERY_S  = int(os.getenv("DECISION_EVERY_S","60"))
+KEEPALIVE_SECONDS = int(os.getenv("KEEPALIVE_SECONDS","60"))
+PORT              = int(os.getenv("PORT","5000"))
+SELF_URL          = os.getenv("RENDER_EXTERNAL_URL","")
+LIVE_TRADING      = os.getenv("LIVE_TRADING","true").lower() == "true"
+USE_TV_BAR        = os.getenv("USE_TV_BAR","false").lower() == "true"  # لو true انتظر إغلاق الشمعة
 
-SYMBOL           = os.getenv("SYMBOL","DOGE/USDT:USDT")   # ccxt Perp format
-INTERVAL         = os.getenv("INTERVAL","15m")
-LEVERAGE         = int(os.getenv("LEVERAGE","10"))
-RISK_ALLOC       = float(os.getenv("RISK_ALLOC","0.60"))
-DECISION_EVERY_S = int(os.getenv("DECISION_EVERY_S","30"))
-KEEPALIVE_SECONDS= int(os.getenv("KEEPALIVE_SECONDS","50"))
-PORT             = int(os.getenv("PORT","5000"))
+# Range Filter (مطابق TV)
+RF_PERIOD = int(os.getenv("RF_PERIOD","20"))
+RF_MULT   = float(os.getenv("RF_MULT","3.5"))
 
-# Range Filter (TradingView-style)
-RF_PERIOD        = int(os.getenv("RF_PERIOD","20"))
-RF_SOURCE        = os.getenv("RF_SOURCE","close")  # close/high/low
-RF_MULT          = float(os.getenv("RF_MULT","3.5"))
-SPREAD_GUARD_BPS = int(os.getenv("SPREAD_GUARD_BPS","6"))
-USE_TV_BAR       = os.getenv("USE_TV_BAR","false").lower()=="true"     # wait candle close
-FORCE_TV_ENTRIES = os.getenv("FORCE_TV_ENTRIES","false").lower()=="true"
+# مؤشرات
+RSI_LEN = int(os.getenv("RSI_LEN","14"))
+ADX_LEN = int(os.getenv("ADX_LEN","14"))
+ATR_LEN = int(os.getenv("ATR_LEN","14"))
 
-# Indicators
-RSI_LEN          = int(os.getenv("RSI_LEN","14"))
-ADX_LEN          = int(os.getenv("ADX_LEN","14"))
-ATR_LEN          = int(os.getenv("ATR_LEN","14"))
-
-# Smart management
-TP1_PCT          = float(os.getenv("TP1_PCT","0.40"))         # 40% move
-TP1_CLOSE_FRAC   = float(os.getenv("TP1_CLOSE_FRAC","0.50"))  # close 50% at TP1
+# إدارة ذكية
+TP1_PCT            = float(os.getenv("TP1_PCT","0.40"))        # هدف أول % ربح
+TP1_CLOSE_FRAC     = float(os.getenv("TP1_CLOSE_FRAC","0.50")) # إغلاق جزء عند TP1
+BREAKEVEN_AFTER_PCT= float(os.getenv("BREAKEVEN_AFTER_PCT","0.30"))
 TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT","0.60"))
-ATR_MULT_TRAIL   = float(os.getenv("ATR_MULT_TRAIL","1.6"))
-GIVEBACK_PCT     = float(os.getenv("GIVEBACK_PCT","0.30"))
-BREAKEVEN_AFTER_PCT = float(os.getenv("BREAKEVEN_AFTER_PCT","0.30"))
-MOVE_3BARS_PCT   = float(os.getenv("MOVE_3BARS_PCT","0.8"))
-MIN_TP_PERCENT   = float(os.getenv("MIN_TP_PERCENT","0.4"))
+ATR_MULT_TRAIL     = float(os.getenv("ATR_MULT_TRAIL","1.6"))
+GIVEBACK_PCT       = float(os.getenv("GIVEBACK_PCT","0.30"))
+MIN_TP_PERCENT     = float(os.getenv("MIN_TP_PERCENT","0.40")) # لا تفعل giveback قبل هذا
 
-# Hold more when trend is strong
-HOLD_TP_STRONG   = os.getenv("HOLD_TP_STRONG","true").lower()=="true"
-HOLD_TP_ADX      = int(os.getenv("HOLD_TP_ADX","28"))
-HOLD_TP_SLOPE    = float(os.getenv("HOLD_TP_SLOPE","0.50"))
-
-USE_SMART_EXIT   = os.getenv("USE_SMART_EXIT","true").lower()=="true"
-
-SELF_URL         = os.getenv("RENDER_EXTERNAL_URL","")
-LIVE_TRADING     = (os.getenv("LIVE_TRADING","true").lower()=="true"
-                    and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET))
-
-# ---------------- Exchange (ccxt) ----------------
+# ================= Exchange =================
 try:
     import ccxt
     ex = ccxt.bingx({
         "apiKey": BINGX_API_KEY,
         "secret": BINGX_API_SECRET,
-        "options": {"defaultType": "swap"},
+        "options": {"defaultType":"swap"},
         "enableRateLimit": True
     })
     ex.set_sandbox_mode(False)
+    CEX_READY = True
+    cprint("✅ Connected to BingX (swap)", "cyan")
 except Exception as e:
     ex = None
-    cprint(f"⚠️ ccxt init error: {e}", "red")
+    CEX_READY = False
+    cprint(f"⚠️ CCXT init error → Paper Mode: {e}", "yellow")
 
-# ---------------- Utils ----------------
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def ema(series, length): return series.ewm(span=length, adjust=False).mean()
-
-def true_range(df):
-    pc = df['close'].shift(1)
-    tr1 = df['high']-df['low']
-    tr2 = (df['high']-pc).abs()
-    tr3 = (df['low']-pc).abs()
-    return pd.concat([tr1,tr2,tr3],axis=1).max(axis=1)
-
-def atr(df, length=14): return true_range(df).rolling(length).mean()
-
-def rsi(series, length=14):
-    d = series.diff()
-    up = d.clip(lower=0).rolling(length).mean()
-    dn = (-d.clip(upper=0)).rolling(length).mean()
-    rs = up/(dn+1e-9)
-    return 100 - (100/(1+rs))
-
-def dx_plus_minus(df, length=14):
-    upMove   = df['high'].diff()
-    downMove = -df['low'].diff()
-    plusDM  = ((upMove>downMove) & (upMove>0)) * upMove
-    minusDM = ((downMove>upMove) & (downMove>0)) * downMove
-    trv = true_range(df).rolling(length).sum()
-    plusDI  = 100 * (plusDM.rolling(length).sum() / (trv+1e-9))
-    minusDI = 100 * (minusDM.rolling(length).sum() / (trv+1e-9))
-    dx = 100 * ( (plusDI - minusDI).abs() / ((plusDI + minusDI)+1e-9) )
-    adx = dx.rolling(length).mean()
-    return plusDI, minusDI, adx
-
-def range_filter(df, length=20, mult=3.5, source="close"):
-    src = df[source].copy()
-    basis = ema(src, length)
-    rng = atr(df, ATR_LEN) * mult
-    up = basis + rng
-    lo = basis - rng
-    buy = (src > up) & (src.shift(1) <= up.shift(1))
-    sell= (src < lo) & (src.shift(1) >= lo.shift(1))
-    return basis, up, lo, buy, sell
-
-def pct(a,b): return 0 if a==0 else (b-a)/a
+def now_utc(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 def nice(x, d=6):
     try: return float(f"{x:.{d}f}")
     except: return x
+def pct(a,b): return 0 if a==0 else (b-a)/a
 
-# ------------- Candles -------------
-def anatomy(o,h,l,c):
-    body = abs(c-o)
-    full = max(h,l) - min(h,l) + 1e-9
-    up = h - max(c,o); lo = min(c,o) - l
-    return body/full, up/full, lo/full
+# ================= Indicators =================
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def true_range(df):
+    pc = df["close"].shift(1)
+    return pd.concat([
+        (df["high"]-df["low"]).abs(),
+        (df["high"]-pc).abs(),
+        (df["low"]-pc).abs()
+    ], axis=1).max(axis=1)
+def atr(df, n): return true_range(df).rolling(n).mean()
+def rsi(s, n):
+    d = s.diff()
+    up = d.clip(lower=0).rolling(n).mean()
+    dn = -d.clip(upper=0).rolling(n).mean()
+    rs = up/(dn+1e-9)
+    return 100 - (100/(1+rs))
+def dx_plus_minus(df, n):
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plusDM  = ((up>dn)&(up>0))*up
+    minusDM = ((dn>up)&(dn>0))*dn
+    tr = true_range(df).rolling(n).sum()
+    plusDI  = 100*(plusDM.rolling(n).sum()/(tr+1e-9))
+    minusDI = 100*(minusDM.rolling(n).sum()/(tr+1e-9))
+    adx = 100*((plusDI-minusDI).abs()/(plusDI+minusDI+1e-9)).rolling(n).mean()
+    return plusDI, minusDI, adx
 
-def is_doji(o,h,l,c, tol=0.1):
-    body, up, lo = anatomy(o,h,l,c)
-    return body<tol and up>0 and lo>0
+def range_filter(df, length=20, mult=3.5):
+    basis = ema(df["close"], length)
+    rng   = atr(df, ATR_LEN)*mult
+    up, lo = basis+rng, basis-rng
+    buy  = (df["close"]>up) & (df["close"].shift(1)<=up.shift(1))
+    sell = (df["close"]<lo) & (df["close"].shift(1)>=lo.shift(1))
+    return basis, up, lo, buy, sell
 
-def is_pin_bull(o,h,l,c):
-    body, up, lo = anatomy(o,h,l,c)
-    return lo>0.55 and body<0.35
+# ================= Candles (مختارة) =================
+def is_doji(o,h,l,c): return abs(c-o)/(h-l+1e-9) < 0.1
+def engulf_bull(prev, cur): return prev["close"]<prev["open"] and cur["close"]>=prev["open"] and cur["open"]<=prev["close"]
+def engulf_bear(prev, cur): return prev["close"]>prev["open"] and cur["close"]<=prev["open"] and cur["open"]>=prev["close"]
 
-def is_pin_bear(o,h,l,c):
-    body, up, lo = anatomy(o,h,l,c)
-    return up>0.55 and body<0.35
-
-def hammer(o,h,l,c): return is_pin_bull(o,h,l,c) and c>o
-def inv_hammer(o,h,l,c): return is_pin_bear(o,h,l,c) and c>o
-def shooting(o,h,l,c): return is_pin_bear(o,h,l,c) and c<o
-
-def engulf_bull(prev, cur):
-    return (cur['open']<cur['close']) and (prev['open']>prev['close']) and \
-           (cur['open']<=prev['close']) and (cur['close']>=prev['open'])
-
-def engulf_bear(prev, cur):
-    return (cur['open']>cur['close']) and (prev['open']<prev['close']) and \
-           (cur['open']>=prev['close']) and (cur['close']<=prev['open'])
-
-def tweez_top(prev, cur):
-    return abs(prev['high']-cur['high'])/max(prev['high'],1e-9)<0.001 and prev['close']>prev['open'] and cur['close']<cur['open']
-
-def tweez_bot(prev, cur):
-    return abs(prev['low']-cur['low'])/max(prev['low'],1e-9)<0.001 and prev['close']<prev['open'] and cur['close']>cur['open']
-
-def piercing(prev, cur):
-    mid=(prev['open']+prev['close'])/2
-    return prev['open']>prev['close'] and cur['open']<prev['close'] and cur['close']>mid
-
-def dark_cloud(prev, cur):
-    mid=(prev['open']+prev['close'])/2
-    return prev['close']>prev['open'] and cur['open']>prev['close'] and cur['close']<mid
-
-def morning_star(c1,c2,c3):
-    return c1['close']<c1['open'] and is_doji(c2['open'],c2['high'],c2['low'],c2['close']) and c3['close']>c3['open'] and c3['close']>((c1['open']+c1['close'])/2)
-
-def evening_star(c1,c2,c3):
-    return c1['close']>c1['open'] and is_doji(c2['open'],c2['high'],c2['low'],c2['close']) and c3['close']<c3['open'] and c3['close']<((c1['open']+c1['close'])/2)
-
-def three_soldiers(df):
-    a=df.iloc[-3];b=df.iloc[-2];c=df.iloc[-1]
-    return all([a['close']>a['open'], b['close']>b['open'], c['close']>c['open']]) and c['close']>b['close']>a['close']
-
-def three_crows(df):
-    a=df.iloc[-3];b=df.iloc[-2];c=df.iloc[-1]
-    return all([a['close']<a['open'], b['close']<b['open'], c['close']<c['open']]) and c['close']<b['close']<a['close']
-
-def explosive(df, bars=3, th=MOVE_3BARS_PCT):
-    last = df.tail(bars)
-    moves = [abs(last.iloc[i]['close']-last.iloc[i]['open']) for i in range(len(last))]
-    a = atr(df).iloc[-1]
-    if a<=0: return False
-    return (sum(moves)/(bars*a)) > th
-
-# ------------- State -------------
+# ================= State =================
 state = {
     "in_position": False,
-    "side": None, "entry": 0.0, "qty": 0.0,
+    "side": None,          # long/short
+    "entry": 0.0,
+    "qty": 0.0,
     "tp1_done": False,
-    "pnl_realized": 0.0,  # (persisted)
-    "pnl_compound": 0.0,
-    "last_close_ts": None,
-    "mode": "SMART",
-    "risk_equity": 0.0,
-    "next_qty_hint": 0.0
+    "pnl_realized": 0.0,   # تراكمي
+    "equity": 0.0,
+    "next_qty_hint": 0.0,
+    "last_bar_ts": None
 }
 STATE_FILE = "pnl_state.json"
-
 def load_state():
     try:
         with open(STATE_FILE,"r") as f: state.update(json.load(f))
     except: pass
 def save_state():
     try:
-        with open(STATE_FILE,"w") as f: json.dump(state,f)
+        with open(STATE_FILE,"w") as f: json.dump(state, f)
     except: pass
 load_state()
 
-# ------------- Data -------------
-def fetch_ohlcv(symbol, tf, limit=300):
-    if ex is None: return None
-    return ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+# ================= Data / Balance =================
+def fetch_df(limit=300):
+    if not CEX_READY: return None
+    o = ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit)
+    df = pd.DataFrame(o, columns=["ts","open","high","low","close","vol"])
+    return df
 
-def to_df(ohlc): return pd.DataFrame(ohlc, columns=["ts","open","high","low","close","vol"])
-
-# ------------- Balance & Sizing -------------
 def get_balance_usdt():
+    if not CEX_READY:  # Paper fallback
+        return max(50.0, state["equity"])
     try:
-        bal = ex.fetch_balance({"type":"swap"})
-        usdt = bal.get("USDT",{})
-        free = usdt.get("free")
-        if free is None:
-            free = bal.get("free",{}).get("USDT", 0.0)
-        return float(free or 0.0)
+        bal = ex.fetch_balance()
+        return float(bal["USDT"]["free"])
     except Exception as e:
-        cprint(f"⚠️ fetch_balance: {e}", "red")
+        cprint(f"⚠️ balance error: {e}", "yellow")
         return 0.0
 
+# ================= Sizing =================
 def compute_qty(price):
-    bal = max(get_balance_usdt(), 0.0)
-    state["risk_equity"] = bal
-    boost = 1.0 + (state["pnl_realized"]/10.0)*0.05  # +5% per $10 realized
-    usd_alloc = max(bal, 10.0) * RISK_ALLOC * boost
+    equity = get_balance_usdt()
+    state["equity"] = equity
+    # ربح تراكمي: زود 5% لكل 10 USDT ربح محقق
+    boost = 1.0 + max(state["pnl_realized"],0.0)/10.0*0.05
+    usd_alloc = equity * RISK_ALLOC * boost
     qty = (usd_alloc * LEVERAGE) / max(price,1e-9)
-    qty = max(qty, 1.0)
-    state["next_qty_hint"] = qty
-    return qty
+    state["next_qty_hint"] = max(qty, 0.0)
+    return max(qty, 1.0)
 
-# ------------- Orders -------------
-def set_leverage(leverage=LEVERAGE):
+# ================= Orders =================
+def set_leverage():
+    if not (CEX_READY and LIVE_TRADING): return
     try:
-        if LIVE_TRADING:
-            ex.set_leverage(leverage, SYMBOL, {"positionSide":"BOTH"})
+        # BingX: ممكن يحتاج side=BOTH لعقود اتجاه واحد
+        ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
     except Exception as e:
-        cprint(f"⚠️ set_leverage: {e}", "red")
+        cprint(f"⚠️ set_leverage: {e}", "yellow")
 
 def market_order(side, qty, reduce=False):
-    if not LIVE_TRADING:
-        return {"paper":True,"side":side,"qty":qty,"reduceOnly":reduce}
-    params = {"reduceOnly": bool(reduce), "positionSide":"BOTH"}
+    if not (CEX_READY and LIVE_TRADING):
+        return {"status":"paper","side":side,"qty":qty,"reduce":reduce}
     try:
-        return ex.create_order(SYMBOL, "market", side, qty, None, params)
+        typ = "sell" if side=="sell" else "buy"
+        params = {"reduceOnly": True} if reduce else {"reduceOnly": False}
+        return ex.create_order(SYMBOL, "market", typ, qty, params=params)
     except Exception as e:
-        cprint(f"⚠️ order err: {e}", "red")
+        cprint(f"❌ order error: {e}", "red")
         return {"status":"error","err":str(e)}
 
-def close_position():
+def close_full():
     if not state["in_position"]: return
+    # عكس اتجاه الصفقة وبـ reduceOnly=True
     side = "sell" if state["side"]=="long" else "buy"
     market_order(side, state["qty"], reduce=True)
-    state.update({"in_position":False,"tp1_done":False,"side":None,"entry":0.0,"qty":0.0})
+    state.update({"in_position":False,"side":None,"entry":0.0,"qty":0.0,"tp1_done":False})
     save_state()
 
-# ------------- Decide -------------
+# ================= Decision =================
 def decide(df):
     df["rsi"] = rsi(df["close"], RSI_LEN)
-    pDI, mDI, ADX = dx_plus_minus(df, ADX_LEN)
-    df["+di"]=pDI; df["-di"]=mDI; df["adx"]=ADX
-    df["atr"]=atr(df, ATR_LEN)
-    rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT, RF_SOURCE)
-    df["rf"]=rf; df["up"]=up; df["lo"]=lo; df["buy_sig"]=b; df["sell_sig"]=s
+    pdi, mdi, adx = dx_plus_minus(df, ADX_LEN)
+    df["+di"], df["-di"], df["adx"] = pdi, mdi, adx
+    df["atr"] = atr(df, ATR_LEN)
+    rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT)
+    df["rf"], df["up"], df["lo"], df["buy"], df["sell"] = rf, up, lo, b, s
 
-    last = df.iloc[-1]; prev = df.iloc[-2]; price = last["close"]
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    price = last["close"]
 
-    # regime
+    # شموع أساسية
+    c_last = {"open":last["open"],"high":last["high"],"low":last["low"],"close":last["close"]}
+    c_prev = {"open":prev["open"],"high":prev["high"],"low":prev["low"],"close":prev["close"]}
+    candles = {
+        "doji": is_doji(**c_last),
+        "engulf_bull": engulf_bull(c_prev, c_last),
+        "engulf_bear": engulf_bear(c_prev, c_last)
+    }
+
+    # نظام السوق
     regime = "TREND_UP" if (last["adx"]>25 and last["+di"]>last["-di"]) else \
              "TREND_DOWN" if (last["adx"]>25 and last["-di"]>last["+di"]) else "RANGE"
 
-    # candles set (for post-entry intelligence)
-    cs = {
-        "doji": is_doji(last["open"],last["high"],last["low"],last["close"]),
-        "pin_bull": is_pin_bull(last["open"],last["high"],last["low"],last["close"]),
-        "pin_bear": is_pin_bear(last["open"],last["high"],last["low"],last["close"]),
-        "hammer": hammer(last["open"],last["high"],last["low"],last["close"]),
-        "inv_hammer": inv_hammer(last["open"],last["high"],last["low"],last["close"]),
-        "shooting": shooting(last["open"],last["high"],last["low"],last["close"]),
-        "engulf_bull": engulf_bull(prev.to_dict(), last.to_dict()),
-        "engulf_bear": engulf_bear(prev.to_dict(), last.to_dict()),
-        "tweez_top": tweez_top(prev.to_dict(), last.to_dict()),
-        "tweez_bot": tweez_bot(prev.to_dict(), last.to_dict()),
-        "piercing": piercing(prev.to_dict(), last.to_dict()),
-        "dark_cloud": dark_cloud(prev.to_dict(), last.to_dict())
-    }
-    if len(df)>=3:
-        c1=df.iloc[-3].to_dict(); c2=df.iloc[-2].to_dict(); c3=df.iloc[-1].to_dict()
-        cs["morning_star"]=morning_star(c1,c2,c3)
-        cs["evening_star"]=evening_star(c1,c2,c3)
-        cs["soldiers"]=three_soldiers(df.tail(3))
-        cs["crows"]=three_crows(df.tail(3))
-    else:
-        cs.update({"morning_star":False,"evening_star":False,"soldiers":False,"crows":False})
+    return price, last, candles, regime, bool(last["buy"]), bool(last["sell"])
 
-    boom = explosive(df, 3, MOVE_3BARS_PCT)
-    sig_buy, sig_sell = bool(last["buy_sig"]), bool(last["sell_sig"])
-    return price, last, cs, regime, boom, sig_buy, sig_sell
-
-def open_position(side, price):
+def consider_entry(price, sig_buy, sig_sell):
     if state["in_position"]: return
-    set_leverage(LEVERAGE)
-    qty = compute_qty(price)
-    market_order("buy" if side=="long" else "sell", qty, reduce=False)
-    state.update({"in_position":True,"side":side,"entry":price,"qty":qty,"tp1_done":False})
-    save_state()
-    cprint(f"🚀 OPEN {side.upper()} | qty={nice(qty)} @ {nice(price)} | lev={LEVERAGE}x", "green" if side=="long" else "red")
-
-def consider_entry(price, sig_buy, sig_sell, regime):
-    if state["in_position"]: return
-    # Strict TV-matching: entries only by RF signal
     if sig_buy:
-        open_position("long", price)
+        qty = compute_qty(price)
+        set_leverage()
+        market_order("buy", qty, reduce=False)
+        state.update({"in_position":True,"side":"long","entry":price,"qty":qty,"tp1_done":False})
+        save_state()
+        cprint(f"🚀 OPEN LONG | qty={nice(qty)} @ {nice(price)} | lev={LEVERAGE}x","green")
     elif sig_sell:
-        open_position("short", price)
+        qty = compute_qty(price)
+        set_leverage()
+        market_order("sell", qty, reduce=False)
+        state.update({"in_position":True,"side":"short","entry":price,"qty":qty,"tp1_done":False})
+        save_state()
+        cprint(f"🧨 OPEN SHORT | qty={nice(qty)} @ {nice(price)} | lev={LEVERAGE}x","red")
 
-# ------------- Post-entry Intelligence -------------
-def manage_position(df, price, last, cs, regime, boom):
+def manage_position(df, price, last):
     if not state["in_position"]: return
-    side, entry, qty = state["side"], state["entry"], state["qty"]
-    a = df["atr"].iloc[-1]; adxv = df["adx"].iloc[-1]
-    rsi_v = df["rsi"].iloc[-1]
+    side = state["side"]; entry = state["entry"]; qty = state["qty"]
+    atrv = float(df["atr"].iloc[-1]); adxv = float(df["adx"].iloc[-1])
 
-    # classify scalp vs trend
-    scalp = (df["atr"].iloc[-1] < df["close"].rolling(20).std().iloc[-1]*0.6) or (last["adx"]<18)
-    if not scalp and adxv>25: state["mode"]="TREND"
-    else: state["mode"]="SCALP"
+    # ربح/خسارة نسبةً للاتجاه
+    gain = pct(entry, price) if side=="long" else pct(price, entry)
+    gain_pct = gain*100
 
-    # TP1
-    up_pct = pct(entry, price) if side=="long" else pct(price, entry)
-    gain_pct = up_pct*100
-    if not state["tp1_done"] and gain_pct>=TP1_PCT*100 and qty>0:
+    # --- TP1 ---
+    if (not state["tp1_done"]) and gain_pct >= TP1_PCT*100:
         cut = max(qty*TP1_CLOSE_FRAC, 0.0)
         if cut>0:
             market_order("sell" if side=="long" else "buy", cut, reduce=True)
-            state["qty"] -= cut
-            state["tp1_done"]=True
-            cprint(f"🎯 TP1 hit • closed {nice(cut)} • remain {nice(state['qty'])}", "cyan")
+            state["qty"] = max(0.0, qty - cut)
+            state["tp1_done"] = True
+            cprint(f"🎯 TP1 hit → closed {nice(cut)} remain={nice(state['qty'])}", "cyan")
 
-    # Breakeven (virtual)
-    if gain_pct>=BREAKEVEN_AFTER_PCT*100:
-        pass  # (managed by trailing/giveback exits)
+    # --- Breakeven (نمنع الخسارة بعد مكسب معقول) ---
+    # نطبق منطقيًا بتتبع الخروج؛ (بدون تعديل أمر وقف فعليًا لتبسيط التكامل).
+    # يمكن تحويله إلى أمر stop-market لاحقًا إن أردت.
+    breakeven_ready = gain_pct >= BREAKEVEN_AFTER_PCT*100
 
-    # ATR trailing (activate in trend or strong push)
-    activate = (gain_pct>=TRAIL_ACTIVATE_PCT*100) or (HOLD_TP_STRONG and adxv>=HOLD_TP_ADX and boom)
-    if activate and a>0:
-        dist = ATR_MULT_TRAIL*a
+    # --- ATR Trailing ---
+    if atrv>0 and (gain_pct>=TRAIL_ACTIVATE_PCT*100 or (adxv>28 and state["tp1_done"])):
+        dist = ATR_MULT_TRAIL*atrv
         if side=="long":
-            stop = max(entry, price - dist)
-            if last["low"]<stop:
-                cprint("🏁 ATR trail exit LONG", "yellow"); close_position()
+            trail_stop = max(entry, price - dist)
+            if last["low"] <= trail_stop:
+                cprint(f"🏁 ATR Trailing exit LONG @ {nice(price)}", "yellow")
+                close_full()
+                return
         else:
-            stop = min(entry, price + dist)
-            if last["high"]>stop:
-                cprint("🏁 ATR trail exit SHORT", "yellow"); close_position()
+            trail_stop = min(entry, price + dist)
+            if last["high"] >= trail_stop:
+                cprint(f"🏁 ATR Trailing exit SHORT @ {nice(price)}", "yellow")
+                close_full()
+                return
 
-    # Giveback (after TP1 or when minimal profit reached)
-    if (state["tp1_done"] or gain_pct>=MIN_TP_PERCENT*100):
+    # --- Giveback ---
+    if state["tp1_done"] and gain_pct >= MIN_TP_PERCENT*100:
+        # لو رجع السعر بنسبة GIVEBACK من القمة/القاع النسبي اخرج
         if side=="long":
-            # bearish reversal set from candles
-            bear_reversal = cs.get("shooting") or cs.get("engulf_bear") or cs.get("tweez_top") or cs.get("evening_star") or cs.get("crows")
-            if bear_reversal or (state["mode"]=="SCALP" and rsi_v>70):
-                cprint("↩️ Giveback exit LONG", "yellow"); close_position()
+            target = entry*(1 + (gain - GIVEBACK_PCT))
+            if price <= target:
+                cprint("↩️ Giveback exit LONG", "yellow")
+                close_full()
         else:
-            bull_reversal = cs.get("hammer") or cs.get("engulf_bull") or cs.get("tweez_bot") or cs.get("morning_star") or cs.get("soldiers")
-            if bull_reversal or (state["mode"]=="SCALP" and rsi_v<30):
-                cprint("↩️ Giveback exit SHORT", "yellow"); close_position()
+            target = entry*(1 - (gain - GIVEBACK_PCT))
+            if price >= target:
+                cprint("↩️ Giveback exit SHORT", "yellow")
+                close_full()
 
-# ------------- Logging -------------
+# ================= Logging (HUD) =================
 def icon(b): return "🟢" if b else "⚪"
-
-def log_compact(df, price, cs, regime, sig_buy, sig_sell):
+def print_hud(df, price, candles, regime, sig_buy, sig_sell):
     last = df.iloc[-1]
-    # Header
-    live_flag = "LIVE" if LIVE_TRADING else "PAPER"
-    cprint(f"\n[{now_utc()}] {SYMBOL} {INTERVAL} • {live_flag} • Mode={state['mode']}", "white")
-    # Indicators row (compact)
-    print(f"📈 RSI{RSI_LEN}:{nice(last['rsi'])}  +DI:{nice(last['+di'])}  -DI:{nice(last['-di'])}  ADX{ADX_LEN}:{nice(last['adx'])}  ATR{ATR_LEN}:{nice(last['atr'])}")
-    # Signals
-    print(f"🔔 BUY:{icon(sig_buy)} SELL:{icon(sig_sell)}  Regime:{regime}  Px:{nice(price)}  RF:{nice(last['rf'])}")
-    # Position
-    if state["in_position"]:
-        pchg = pct(state["entry"], last['close']) if state["side"]=="long" else pct(last['close'], state["entry"])
-        print(f"🎯 POS: {'🟩LONG' if state['side']=='long' else '🟥SHORT'}  entry:{nice(state['entry'])}  qty:{nice(state['qty'])}  Δ:{nice(pchg*100,2)}%  TP1:{'✅' if state['tp1_done'] else '…'}")
-    else:
-        print(f"🟨 FLAT  next_qty@{LEVERAGE}x ≈ {nice(state['next_qty_hint'])}")
-    # Result summary
-    print(f"💰 Balance≈{nice(state['risk_equity'])} USDT  |  RealizedPnL={nice(state['pnl_realized'])} USDT")
+    print()
+    header = f"{SYMBOL} • {INTERVAL} • {'LIVE' if (CEX_READY and LIVE_TRADING) else 'PAPER'} • {now_utc()}"
+    cprint(header, "white", "on_blue")
 
-# ------------- Loop -------------
-def loop():
+    # مؤشرات
+    print(colored("INDICATORS","cyan"))
+    print(f"  💠 Price={nice(price)}  RF={nice(last['rf'])}  hi={nice(last['high'])}  lo={nice(last['low'])}")
+    print(f"  📈 RSI({RSI_LEN})={nice(last['rsi'],2)}  +DI={nice(last['+di'],2)}  -DI={nice(last['-di'],2)}  ADX({ADX_LEN})={nice(last['adx'],2)}  ATR={nice(df['atr'].iloc[-1])}")
+    print(f"  🧭 Regime={regime}   🔔 BUY={icon(sig_buy)}  🔻 SELL={icon(sig_sell)}")
+
+    # شموع
+    print(colored("CANDLES","magenta"))
+    print(f"  Doji={icon(candles['doji'])} | EngulfBull={icon(candles['engulf_bull'])} | EngulfBear={icon(candles['engulf_bear'])}")
+
+    # مركز
+    print(colored("POSITION","blue"))
+    if state["in_position"]:
+        change = pct(state["entry"], price) if state["side"]=="long" else pct(price, state["entry"])
+        side_ico = "🟩 LONG" if state["side"]=="long" else "🟥 SHORT"
+        print(f"  {side_ico}  entry={nice(state['entry'])}  qty={nice(state['qty'])}  Δ={nice(change*100,2)}%  TP1={icon(state['tp1_done'])}")
+    else:
+        print(f"  🟨 FLAT  | next_qty_hint≈{nice(state['next_qty_hint'])} @ {LEVERAGE}x")
+
+    # نتائج
+    equity = get_balance_usdt()
+    print(colored("RESULTS","green"))
+    print(f"  💰 Balance={nice(equity,2)} USDT  |  PnL(Σ)={nice(state['pnl_realized'],2)}  |  EffectiveEq≈{nice(equity,2)}")
+
+# ================= Loop =================
+def strategy_loop():
     while True:
         try:
-            ohlc = fetch_ohlcv(SYMBOL, INTERVAL, 300)
-            if not ohlc:
-                cprint("No data.", "red"); time.sleep(DECISION_EVERY_S); continue
-            df = to_df(ohlc)
-            price, last, cs, regime, boom, sig_buy, sig_sell = decide(df)
+            df = fetch_df()
+            if df is None or df.empty:
+                cprint("⚠️ No data fetched", "red")
+                time.sleep(DECISION_EVERY_S); continue
 
-            # only at candle close if requested
-            if USE_TV_BAR:
-                ts = df.iloc[-1]['ts']
-                if state["last_close_ts"] == ts:
-                    time.sleep(DECISION_EVERY_S); continue
-                state["last_close_ts"] = ts
+            # إغلاق الشمعة (لو USE_TV_BAR=true)
+            bar_ts = int(df["ts"].iloc[-1])
+            if USE_TV_BAR and state["last_bar_ts"] == bar_ts:
+                # HUD فقط
+                price = df["close"].iloc[-1]
+                # مؤشرات للعرض فقط
+                rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT)
+                df["rf"]=rf; df["atr"]=atr(df, ATR_LEN)
+                pdi,mdi,adx = dx_plus_minus(df, ADX_LEN)
+                df["+di"]=pdi; df["-di"]=mdi; df["adx"]=adx; df["rsi"]=rsi(df["close"],RSI_LEN)
+                candles = {"doji": False, "engulf_bull": False, "engulf_bear": False}
+                print_hud(df, price, candles, "—", bool(b.iloc[-1]), bool(s.iloc[-1]))
+                time.sleep(DECISION_EVERY_S); continue
+            state["last_bar_ts"] = bar_ts
 
-            manage_position(df, price, last, cs, regime, boom)
-            consider_entry(price, sig_buy, sig_sell, regime)
-            log_compact(df, price, cs, regime, sig_buy, sig_sell)
+            price, last, candles, regime, sig_buy, sig_sell = decide(df)
+
+            # إدارة الصفقة الحالية
+            manage_position(df, price, last)
+
+            # دخول جديد (توافق TV)
+            consider_entry(price, sig_buy, sig_sell)
+
+            # HUD
+            print_hud(df, price, candles, regime, sig_buy, sig_sell)
 
         except Exception as e:
-            cprint(f"❌ loop err: {e}\n{traceback.format_exc()}", "red")
+            cprint(f"❌ loop error: {e}", "red")
+            print(traceback.format_exc())
         time.sleep(DECISION_EVERY_S)
 
-# ------------- Flask -------------
+# ================= Flask =================
+from flask import Flask, jsonify
 app = Flask(__name__)
-logging.getLogger("werkzeug").setLevel(logging.ERROR)  # suppress noisy HTTP logs
 
 @app.route("/")
 def home():
-    return f"OK • {SYMBOL} • {INTERVAL} • LIVE={'ON' if LIVE_TRADING else 'OFF'} • {now_utc()}"
-
-@app.route("/metrics")
-def metrics():
     return jsonify({
         "ts": now_utc(),
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "live": LIVE_TRADING,
-        "state": state
+        "live": (CEX_READY and LIVE_TRADING),
+        "equity": state["equity"],
+        "pnl": state["pnl_realized"],
+        "in_position": state["in_position"],
+        "side": state["side"],
+        "entry": state["entry"],
+        "qty": state["qty"]
     })
 
 @app.route("/ping")
@@ -453,16 +382,16 @@ def ping(): return "pong"
 def keepalive():
     if not SELF_URL: return
     while True:
-        try: requests.get(SELF_URL, timeout=4)
+        try: requests.get(SELF_URL, timeout=5)
         except: pass
         time.sleep(KEEPALIVE_SECONDS)
 
-# ------------- Start -------------
-if __name__=="__main__":
-    cprint(f"Starting Pro AI bot • {SYMBOL} • {INTERVAL} • LIVE={LIVE_TRADING}", "white", "on_blue")
-    if ex:
-        try: set_leverage(LEVERAGE)
-        except: pass
-    threading.Thread(target=loop, daemon=True).start()
-    if SELF_URL: threading.Thread(target=keepalive, daemon=True).start()
+# ================= Start =================
+if __name__ == "__main__":
+    mode = "LIVE" if (CEX_READY and LIVE_TRADING) else "PAPER"
+    cprint(f"🚀 Starting SMART BOT • {SYMBOL} • MODE={mode}", "white", "on_blue")
+    try: set_leverage()
+    except: pass
+    threading.Thread(target=strategy_loop, daemon=True).start()
+    threading.Thread(target=keepalive, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False)
