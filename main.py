@@ -1,58 +1,68 @@
-# ==========================================================
-# main.py — DOGE/USDT Smart Bot (Final, Clean Logs, BingX-ready)
-#  - Entries: TradingView-like Range Filter (EXACT-style)
-#  - Indicators: RSI / +DI / -DI / ADX / ATR
-#  - Post-entry Mgmt: TP1 + Breakeven + ATR-Trailing + Giveback
-#  - Scalp vs Trend awareness via ADX/ATR
-#  - 60% equity sizing + cumulative PnL boost
-#  - BingX Position Mode: oneway/hedge (ENV) + safe state updates
-#  - Clean logs every DECISION_EVERY_S; suppress HTTP noise
-#  - / (status) + /metrics + keepalive (2-line heartbeat)
-# ==========================================================
+# main.py
+# ==============================================
+# DOGE/USDT (BingX Perp) — Pro Strategy (TV-match)
+# - TV entries via Range Filter (upper/lower cross)
+# - Indicators: RSI/ADX/+DI/-DI/ATR
+# - Full candle set (Doji/Pin/Hammer/Inv/Shooting/Gravestone/
+#   Engulfing/Tweezers/Morning/Evening/Piercing/DarkCloud/
+#   Soldiers/Crows)
+# - Smart Mgmt: TP1 + Breakeven + ATR Trailing + Giveback
+# - Regime: RANGE/TREND_UP/TREND_DOWN  (scalp vs trend bias)
+# - Cumulative PnL sizing (next position uses realized PnL)
+# - Clean HUD logs + /metrics + light keepalive
+# ==============================================
 
-import os, time, json, threading, traceback, logging
+import os, time, math, json, threading, traceback
 from datetime import datetime, timezone
 import pandas as pd
+from flask import Flask, jsonify
 from termcolor import cprint, colored
-import requests
 
-# ===================== ENV =====================
-BINGX_API_KEY      = os.getenv("BINGX_API_KEY","")
-BINGX_API_SECRET   = os.getenv("BINGX_API_SECRET","")
-SYMBOL             = os.getenv("SYMBOL","DOGE/USDT:USDT")
-INTERVAL           = os.getenv("INTERVAL","15m")
-LEVERAGE           = int(os.getenv("LEVERAGE","10"))
-RISK_ALLOC         = float(os.getenv("RISK_ALLOC","0.60"))   # 60% of equity
-DECISION_EVERY_S   = int(os.getenv("DECISION_EVERY_S","60"))
-KEEPALIVE_SECONDS  = int(os.getenv("KEEPALIVE_SECONDS","60"))
-PORT               = int(os.getenv("PORT","5000"))
-SELF_URL           = os.getenv("RENDER_EXTERNAL_URL","")
-LIVE_TRADING       = os.getenv("LIVE_TRADING","true").lower()=="true"
-USE_TV_BAR         = os.getenv("USE_TV_BAR","false").lower()=="true"  # if true: act only on bar close
-SPREAD_GUARD_BPS   = int(os.getenv("SPREAD_GUARD_BPS","6"))
+# ---------- ENV ----------
+BINGX_API_KEY        = os.getenv("BINGX_API_KEY","")
+BINGX_API_SECRET     = os.getenv("BINGX_API_SECRET","")
+BINGX_POSITION_MODE  = os.getenv("BINGX_POSITION_MODE","oneway").lower()   # oneway | hedge
 
-# BingX Position Mode: oneway | hedge
-BINGX_POSITION_MODE = os.getenv("BINGX_POSITION_MODE","oneway").lower().strip()  # "oneway" or "hedge"
+SYMBOL               = os.getenv("SYMBOL","DOGE/USDT:USDT")
+INTERVAL             = os.getenv("INTERVAL","15m")
+LEVERAGE             = int(os.getenv("LEVERAGE","10"))
+RISK_ALLOC           = float(os.getenv("RISK_ALLOC","0.60"))
+DECISION_EVERY_S     = int(os.getenv("DECISION_EVERY_S","30"))
+KEEPALIVE_SECONDS    = int(os.getenv("KEEPALIVE_SECONDS","60"))
+PORT                 = int(os.getenv("PORT","5000"))
 
-# Range Filter (TV-style)
-RF_PERIOD          = int(os.getenv("RF_PERIOD","20"))
-RF_MULT            = float(os.getenv("RF_MULT","3.5"))
+# Range Filter (TV)
+RF_PERIOD            = int(os.getenv("RF_PERIOD","20"))
+RF_SOURCE            = os.getenv("RF_SOURCE","close")
+RF_MULT              = float(os.getenv("RF_MULT","3.5"))
+SPREAD_GUARD_BPS     = int(os.getenv("SPREAD_GUARD_BPS","6"))
+USE_TV_BAR           = os.getenv("USE_TV_BAR","false").lower()=="true"
+FORCE_TV_ENTRIES     = os.getenv("FORCE_TV_ENTRIES","false").lower()=="true"
 
 # Indicators
-RSI_LEN            = int(os.getenv("RSI_LEN","14"))
-ADX_LEN            = int(os.getenv("ADX_LEN","14"))
-ATR_LEN            = int(os.getenv("ATR_LEN","14"))
+RSI_LEN              = int(os.getenv("RSI_LEN","14"))
+ADX_LEN              = int(os.getenv("ADX_LEN","14"))
+ATR_LEN              = int(os.getenv("ATR_LEN","14"))
 
-# Smart Mgmt thresholds
-TP1_PCT            = float(os.getenv("TP1_PCT","0.40"))        # +0.40%
-TP1_CLOSE_FRAC     = float(os.getenv("TP1_CLOSE_FRAC","0.50")) # close 50% at TP1
-BREAKEVEN_AFTER_PCT= float(os.getenv("BREAKEVEN_AFTER_PCT","0.30"))
-TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT","0.60"))
-ATR_MULT_TRAIL     = float(os.getenv("ATR_MULT_TRAIL","1.6"))
-GIVEBACK_PCT       = float(os.getenv("GIVEBACK_PCT","0.30"))
-MIN_TP_PERCENT     = float(os.getenv("MIN_TP_PERCENT","0.40"))
+# Smart Mgmt
+TP1_PCT              = float(os.getenv("TP1_PCT","0.40"))      # take first profits %
+TP1_CLOSE_FRAC       = float(os.getenv("TP1_CLOSE_FRAC","0.50"))
+BREAKEVEN_AFTER_PCT  = float(os.getenv("BREAKEVEN_AFTER_PCT","0.30"))
+TRAIL_ACTIVATE_PCT   = float(os.getenv("TRAIL_ACTIVATE_PCT","0.60"))
+ATR_MULT_TRAIL       = float(os.getenv("ATR_MULT_TRAIL","1.6"))
+GIVEBACK_PCT         = float(os.getenv("GIVEBACK_PCT","0.30"))
+MIN_TP_PERCENT       = float(os.getenv("MIN_TP_PERCENT","0.40"))
+HOLD_TP_STRONG       = os.getenv("HOLD_TP_STRONG","true").lower()=="true"
+HOLD_TP_ADX          = int(os.getenv("HOLD_TP_ADX","28"))
+HOLD_TP_SLOPE        = float(os.getenv("HOLD_TP_SLOPE","0.50"))
+USE_SMART_EXIT       = os.getenv("USE_SMART_EXIT","true").lower()=="true"
 
-# ===================== Exchange =====================
+# Runtime
+SELF_URL             = os.getenv("RENDER_EXTERNAL_URL","")
+LIVE_TRADING         = os.getenv("LIVE_TRADING","true").lower()=="true"
+PING_LOG_EVERY_N     = int(os.getenv("PING_LOG_EVERY_N","2"))   # اطبع سطرين فقط كل دقيقة
+
+# ---------- ccxt (BingX swap) ----------
 try:
     import ccxt
     ex = ccxt.bingx({
@@ -62,63 +72,116 @@ try:
         "enableRateLimit": True
     })
     ex.set_sandbox_mode(False)
-    CEX_READY = True
-    cprint("✅ Connected to BingX (swap)", "cyan")
 except Exception as e:
     ex = None
-    CEX_READY = False
-    cprint(f"⚠️ CCXT init error → PAPER mode. {e}", "yellow")
+    cprint(f"⚠️ ccxt init error: {e}", "red")
 
-def now_utc(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+# ---------- helpers ----------
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def ema(series, length): return series.ewm(span=length, adjust=False).mean()
+
+def true_range(df):
+    pc = df['close'].shift(1)
+    return pd.concat([(df['high']-df['low']).abs(),
+                      (df['high']-pc).abs(),
+                      (df['low']-pc).abs()],axis=1).max(axis=1)
+
+def atr(df, length=14): return true_range(df).rolling(length).mean()
+
+def rsi(series, length=14):
+    d = series.diff()
+    up = d.clip(lower=0).rolling(length).mean()
+    dn = (-d.clip(upper=0)).rolling(length).mean()
+    rs = up/(dn+1e-9)
+    return 100 - (100/(1+rs))
+
+def dx_plus_minus(df, length=14):
+    upm   = df['high'].diff()
+    downm = -df['low'].diff()
+    plusDM  = ((upm>downm)&(upm>0))*upm
+    minusDM = ((downm>upm)&(downm>0))*downm
+    trv  = true_range(df).rolling(length).sum()
+    plusDI  = 100*(plusDM.rolling(length).sum()/(trv+1e-9))
+    minusDI = 100*(minusDM.rolling(length).sum()/(trv+1e-9))
+    dx = 100*((plusDI-minusDI).abs()/((plusDI+minusDI)+1e-9))
+    adx = dx.rolling(length).mean()
+    return plusDI, minusDI, adx
+
+def range_filter(df, length=20, mult=3.5, source="close"):
+    src   = df[source]
+    basis = ema(src, length)
+    rng   = atr(df, ATR_LEN)*mult
+    upper = basis + rng
+    lower = basis - rng
+    buy   = (src>upper) & (src.shift(1)<=upper.shift(1))
+    sell  = (src<lower) & (src.shift(1)>=lower.shift(1))
+    return basis, upper, lower, buy, sell
+
+def pct(a,b): return 0 if a==0 else (b-a)/a
 def nice(x, d=6):
     try: return float(f"{x:.{d}f}")
     except: return x
-def pct(a,b): return 0.0 if a==0 else (b-a)/a
+def icon(b): return "🟢" if b else "⚪"
 
-# ===================== Indicators =====================
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def true_range(df):
-    pc = df["close"].shift(1)
-    return pd.concat([(df["high"]-df["low"]).abs(), (df["high"]-pc).abs(), (df["low"]-pc).abs()], axis=1).max(axis=1)
-def atr(df, n=14): return true_range(df).rolling(n).mean()
-def rsi(s, n=14):
-    d = s.diff(); up = d.clip(lower=0).rolling(n).mean(); dn = (-d.clip(upper=0)).rolling(n).mean()
-    rs = up/(dn+1e-9)
-    return 100 - (100/(1+rs))
-def dx_plus_minus(df, n=14):
-    up = df["high"].diff(); dn = -df["low"].diff()
-    plusDM  = ((up>dn)&(up>0))*up
-    minusDM = ((dn>up)&(dn>0))*dn
-    tr = true_range(df).rolling(n).sum()
-    plusDI  = 100*(plusDM.rolling(n).sum()/(tr+1e-9))
-    minusDI = 100*(minusDM.rolling(n).sum()/(tr+1e-9))
-    adx = 100*((plusDI-minusDI).abs()/(plusDI+minusDI+1e-9)).rolling(n).mean()
-    return plusDI, minusDI, adx
+# ---------- candles ----------
+def body_up_low(o,h,l,c):
+    body = abs(c-o); full = (h-l)+1e-9
+    up = h - max(o,c); lo = min(o,c) - l
+    return body/full, up/full, lo/full
 
-def range_filter(df, length=20, mult=3.5):
-    basis = ema(df["close"], length)
-    rng   = atr(df, ATR_LEN) * mult
-    up, lo = basis + rng, basis - rng
-    buy  = (df["close"]>up) & (df["close"].shift(1)<=up.shift(1))
-    sell = (df["close"]<lo) & (df["close"].shift(1)>=lo.shift(1))
-    return basis, up, lo, buy, sell
+def is_doji(o,h,l,c,tol=0.1):
+    body, up, lo = body_up_low(o,h,l,c); return body<tol and up>0 and lo>0
+def is_spinning_top(o,h,l,c):
+    body, up, lo = body_up_low(o,h,l,c); return body<0.3 and up>0.2 and lo>0.2
+def is_pin_bull(o,h,l,c):
+    body, up, lo = body_up_low(o,h,l,c); return lo>0.55 and body<0.35
+def is_pin_bear(o,h,l,c):
+    body, up, lo = body_up_low(o,h,l,c); return up>0.55 and body<0.35
+def is_hammer(o,h,l,c):       return is_pin_bull(o,h,l,c) and c>o
+def is_inv_hammer(o,h,l,c):   return is_pin_bear(o,h,l,c) and c>o
+def is_shooting_star(o,h,l,c):return is_pin_bear(o,h,l,c) and c<o
+def is_gravestone(o,h,l,c):   return is_doji(o,h,l,c) and (h-max(c,o))>(min(c,o)-l)*2
 
-# ===================== Candles (light set) =====================
-def is_doji(o,h,l,c): return abs(c-o)/(h-l+1e-9) < 0.1
-def engulf_bull(prev, cur): return prev["close"]<prev["open"] and cur["open"]<=prev["close"] and cur["close"]>=prev["open"]
-def engulf_bear(prev, cur): return prev["close"]>prev["open"] and cur["open"]>=prev["close"] and cur["close"]<=prev["open"]
+def engulf_bull(p, q):
+    return (q['open']<q['close']) and (p['open']>p['close']) and (q['open']<=p['close']) and (q['close']>=p['open'])
+def engulf_bear(p, q):
+    return (q['open']>q['close']) and (p['open']<p['close']) and (q['open']>=p['close']) and (q['close']<=p['open'])
 
-# ===================== State =====================
+def tweez_top(p, q):  return abs(p['high']-q['high'])/max(p['high'],1e-9)<0.001 and p['close']>p['open'] and q['close']<q['open']
+def tweez_bot(p, q):  return abs(p['low']-q['low'])/max(p['low'],1e-9)<0.001 and p['close']<p['open'] and q['close']>q['open']
+def piercing(p, q):
+    p_mid=(p['open']+p['close'])/2
+    return p['open']>p['close'] and q['open']<p['close'] and q['close']>p_mid
+def darkcloud(p, q):
+    p_mid=(p['open']+p['close'])/2
+    return p['close']>p['open'] and q['open']>p['close'] and q['close']<p_mid
+def morning_star(c1,c2,c3):
+    return c1['close']<c1['open'] and is_doji(c2['open'],c2['high'],c2['low'],c2['close']) and c3['close']>c3['open'] and c3['close']>((c1['open']+c1['close'])/2)
+def evening_star(c1,c2,c3):
+    return c1['close']>c1['open'] and is_doji(c2['open'],c2['high'],c2['low'],c2['close']) and c3['close']<c3['open'] and c3['close']<((c1['open']+c1['close'])/2)
+def soldiers3(df):
+    a,b,c = df.iloc[-3],df.iloc[-2],df.iloc[-1]
+    return a['close']>a['open'] and b['close']>b['open'] and c['close']>c['open'] and c['close']>b['close']>a['close']
+def crows3(df):
+    a,b,c = df.iloc[-3],df.iloc[-2],df.iloc[-1]
+    return a['close']<a['open'] and b['close']<b['open'] and c['close']<c['open'] and c['close']<b['close']<a['close']
+
+# ---------- state ----------
 state = {
     "in_position": False,
-    "side": None,      # long/short
+    "side": None,           # long/short
     "entry": 0.0,
     "qty": 0.0,
     "tp1_done": False,
     "pnl_realized": 0.0,
-    "equity": 0.0,
+    "pnl_compound": 0.0,
+    "risk_equity": 0.0,
     "next_qty_hint": 0.0,
-    "last_bar_ts": None
+    "last_close_ts": None,
+    "mode": "SMART",
+    "position_mode": BINGX_POSITION_MODE.upper(),
 }
 STATE_FILE = "pnl_state.json"
 def load_state():
@@ -131,327 +194,270 @@ def save_state():
     except: pass
 load_state()
 
-# ===================== BingX helpers =====================
-def is_hedge(): return BINGX_POSITION_MODE == "hedge"
+# ---------- data ----------
+def fetch_ohlcv(symbol, tf, limit=300):
+    if ex is None: return None
+    return ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
 
-def apply_position_mode():
-    if not (CEX_READY and LIVE_TRADING): return
-    try:
-        # ccxt unified: set_position_mode(hedgeMode: bool, symbol=None, params={})
-        ex.set_position_mode(is_hedge(), SYMBOL)
-        cprint(f"✅ PositionMode → {'HEDGE' if is_hedge() else 'ONE-WAY'}", "cyan")
-    except Exception as e:
-        cprint(f"⚠️ set_position_mode skipped: {e}", "yellow")
+def df_from_ohlc(ohlc):
+    return pd.DataFrame(ohlc, columns=["ts","open","high","low","close","vol"])
 
-def set_leverage():
-    if not (CEX_READY and LIVE_TRADING): return
-    try:
-        ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})  # for oneway; OK for hedge too
-    except Exception as e:
-        cprint(f"⚠️ set_leverage: {e}", "yellow")
-
-def pos_side_for_open(order_side):  # 'buy' → LONG, 'sell' → SHORT (in hedge) else BOTH
-    if is_hedge():
-        return "LONG" if order_side=="buy" else "SHORT"
-    return "BOTH"
-
-def pos_side_for_close(current_pos):  # current_pos: 'long'|'short'
-    if is_hedge():
-        return "LONG" if current_pos=="long" else "SHORT"
-    return "BOTH"
-
-def build_order_params(position_side, reduce_only=False):
-    return {"positionSide": position_side, "reduceOnly": bool(reduce_only)}
-
-def order_success(resp: dict) -> bool:
-    if not isinstance(resp, dict): return False
-    st = str(resp.get("status","")).lower()
-    if st in ("rejected","canceled","error"): return False
-    return bool(resp.get("id") or resp.get("orderId") or resp.get("info"))
-
-# ===================== Data / Balance / Sizing =====================
-def fetch_df(limit=300):
-    if not CEX_READY: return None
-    o = ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit)
-    return pd.DataFrame(o, columns=["ts","open","high","low","close","vol"])
-
+# ---------- balance & sizing ----------
 def get_balance_usdt():
-    if not CEX_READY:
-        return max(50.0, state["equity"])  # paper fallback
     try:
-        # Prefer swap; fallback spot
-        for q in ({'type':'swap'}, {'type':'spot'}, {}):
-            try:
-                b = ex.fetch_balance(q)
-                for path in [
-                    lambda d: float(d['USDT']['free']),
-                    lambda d: float(d['free']['USDT']),
-                    lambda d: float(d['total']['USDT']),
-                ]:
-                    try: return path(b)
-                    except: pass
-            except: pass
-        cprint("⚠️ USDT balance not found in swap/spot.", "yellow")
+        if ex is None: return 0.0
+        b = ex.fetch_balance()
+        # BingX swap USDT:
+        for k in ("USDT","usdt"):
+            if k in b: 
+                free = b[k].get("free")
+                if free is not None: return float(free)
+        # fallback
+        return float(b.get("free",0))
+    except:
         return 0.0
-    except Exception as e:
-        cprint(f"⚠️ balance error: {e}", "yellow"); return 0.0
 
 def compute_qty(price):
-    equity = get_balance_usdt()
-    state["equity"] = equity
-    # cumulative boost: +5% per +10 USDT realized pnl (only positive side)
-    boost = 1.0 + max(state["pnl_realized"],0.0)/10.0*0.05
-    usd_alloc = equity * RISK_ALLOC * boost
+    bal = get_balance_usdt()
+    state["risk_equity"] = bal
+    boost = 1.0 + (state["pnl_realized"]/10.0)*0.05
+    usd_alloc = max(bal, 10.0) * RISK_ALLOC * boost
     qty = (usd_alloc * LEVERAGE) / max(price,1e-9)
-    qty = max(qty, 1.0)
     state["next_qty_hint"] = qty
-    return qty
+    return max(qty, 1.0)
 
-# ===================== Orders (safe) =====================
-def market_order(order_side, qty, reduce=False, position_side=None):
-    """
-    order_side: 'buy' | 'sell'
-    reduce: close/reduceOnly
-    """
-    if position_side is None:
-        position_side = pos_side_for_open(order_side)
+# ---------- orders ----------
+def set_leverage(lv):
+    try:
+        if not LIVE_TRADING or ex is None: return
+        ex.set_leverage(lv, SYMBOL, params={"positionSide":"BOTH"} if BINGX_POSITION_MODE=="oneway" else {})
+    except Exception as e:
+        cprint(f"⚠️ set_leverage: {e}", "red")
 
-    if not (CEX_READY and LIVE_TRADING):
-        return {"status":"paper","side":order_side,"qty":qty,"reduce":reduce,"positionSide":position_side}
+def place_market(side, qty, reduce_only=False):
+    if not LIVE_TRADING or ex is None:
+        return {"status":"paper","side":side,"qty":qty,"reduceOnly":reduce_only}
+
+    params={}
+    if BINGX_POSITION_MODE=="hedge":
+        params["positionSide"] = "LONG" if side=="buy" else "SHORT"
+    else:
+        params["positionSide"]="BOTH"
+    if reduce_only:
+        params["reduceOnly"] = True
 
     try:
-        params = build_order_params(position_side, reduce_only=reduce)
-        return ex.create_order(SYMBOL, "market", order_side, qty, params=params)
+        o = ex.create_order(SYMBOL, "market", side, qty, params=params)
+        return {"status":"ok","resp":o}
     except Exception as e:
-        cprint(f"❌ order error: {e}", "red")
         return {"status":"error","err":str(e)}
 
 def open_position(side, price):
     if state["in_position"]: return
-    set_leverage()
+    set_leverage(LEVERAGE)
     qty = compute_qty(price)
-    order_side = "buy" if side=="long" else "sell"
-    pos_side = pos_side_for_open(order_side)
-    resp = market_order(order_side, qty, reduce=False, position_side=pos_side)
-    if order_success(resp):
+    # طلب حقيقي
+    resp = place_market("buy" if side=="long" else "sell", qty, reduce_only=False)
+    if resp.get("status")=="ok":
         state.update({"in_position":True,"side":side,"entry":price,"qty":qty,"tp1_done":False})
         save_state()
-        cprint(f"{'🚀' if side=='long' else '🧨'} OPEN {side.upper()} | qty={nice(qty)} @ {nice(price)} | lev={LEVERAGE}x [{pos_side}]",
-               "green" if side=='long' else "red")
+        cprint(f"🚀 OPEN {side.upper()} | qty={nice(qty)} @ {nice(price)} | lev={LEVERAGE}x", "green" if side=="long" else "red")
     else:
-        cprint(f"⚠️ OPEN {side.upper()} rejected; state not changed. Resp={resp}", "yellow")
+        cprint(f"⚠️ OPEN failed: {resp.get('err')}", "red")
 
-def close_full():
+def close_position():
     if not state["in_position"]: return
-    order_side = "sell" if state["side"]=="long" else "buy"
-    pos_side = pos_side_for_close(state["side"])
-    resp = market_order(order_side, state["qty"], reduce=True, position_side=pos_side)
-    if order_success(resp):
+    side_close = "sell" if state["side"]=="long" else "buy"
+    resp = place_market(side_close, state["qty"], reduce_only=True)
+    if resp.get("status")=="ok":
         state.update({"in_position":False,"side":None,"entry":0.0,"qty":0.0,"tp1_done":False})
         save_state()
-        cprint(f"✅ CLOSED [{pos_side}]", "cyan")
+        cprint("🏁 CLOSED position", "yellow")
     else:
-        cprint(f"❌ CLOSE rejected; keeping local state. Resp={resp}", "red")
+        cprint(f"⚠️ CLOSE failed: {resp.get('err')}", "red")
 
-# ===================== Spread guard =====================
-def orderbook_spread_bps():
-    try:
-        ob = ex.fetch_order_book(SYMBOL, limit=5)
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        if not (bid and ask): return None
-        mid = (bid+ask)/2.0
-        return ((ask-bid)/mid)*10000.0
-    except Exception:
-        return None
-
-# ===================== Decide & Manage =====================
+# ---------- decide ----------
 def decide(df):
     df["rsi"] = rsi(df["close"], RSI_LEN)
-    pdi, mdi, adx = dx_plus_minus(df, ADX_LEN)
-    df["+di"], df["-di"], df["adx"] = pdi, mdi, adx
+    plusDI, minusDI, ADX = dx_plus_minus(df, ADX_LEN)
+    df["+di"]=plusDI; df["-di"]=minusDI; df["adx"]=ADX
     df["atr"] = atr(df, ATR_LEN)
-    rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT)
-    df["rf"], df["up"], df["lo"], df["buy"], df["sell"] = rf, up, lo, b, s
+    rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT, RF_SOURCE)
+    df["rf"]=rf; df["up"]=up; df["lo"]=lo; df["buy_sig"]=b; df["sell_sig"]=s
 
-    last = df.iloc[-1]; prev = df.iloc[-2]; price = last["close"]
+    last, prev = df.iloc[-1], df.iloc[-2]
+    price = last["close"]
 
-    # candles for mgmt
-    c_last = {"open":last["open"],"high":last["high"],"low":last["low"],"close":last["close"]}
-    c_prev = {"open":prev["open"],"high":prev["high"],"low":prev["low"],"close":prev["close"]}
-    candles = {
-        "doji": is_doji(**c_last),
-        "engulf_bull": engulf_bull(c_prev, c_last),
-        "engulf_bear": engulf_bear(c_prev, c_last)
+    c = {
+        "doji":           is_doji(last["open"],last["high"],last["low"],last["close"]),
+        "pin_bull":       is_pin_bull(last["open"],last["high"],last["low"],last["close"]),
+        "pin_bear":       is_pin_bear(last["open"],last["high"],last["low"],last["close"]),
+        "hammer":         is_hammer(last["open"],last["high"],last["low"],last["close"]),
+        "inv_hammer":     is_inv_hammer(last["open"],last["high"],last["low"],last["close"]),
+        "shooting":       is_shooting_star(last["open"],last["high"],last["low"],last["close"]),
+        "gravestone":     is_gravestone(last["open"],last["high"],last["low"],last["close"]),
+        "engulf_bull":    engulf_bull(prev.to_dict(), last.to_dict()),
+        "engulf_bear":    engulf_bear(prev.to_dict(), last.to_dict()),
+        "tweezer_top":    tweez_top(prev.to_dict(), last.to_dict()),
+        "tweezer_bot":    tweez_bot(prev.to_dict(), last.to_dict()),
+        "piercing":       piercing(prev.to_dict(), last.to_dict()),
+        "darkcloud":      darkcloud(prev.to_dict(), last.to_dict()),
+        "morning_star":   False,
+        "evening_star":   False,
+        "soldiers":       False,
+        "black_crows":    False
     }
+    if len(df)>=3:
+        a,b,c3 = df.iloc[-3].to_dict(), prev.to_dict(), last.to_dict()
+        c["morning_star"] = morning_star(a,b,c3)
+        c["evening_star"] = evening_star(a,b,c3)
+        c["soldiers"]     = soldiers3(df.tail(3))
+        c["black_crows"]  = crows3(df.tail(3))
 
     regime = "TREND_UP" if (last["adx"]>25 and last["+di"]>last["-di"]) else \
              "TREND_DOWN" if (last["adx"]>25 and last["-di"]>last["+di"]) else "RANGE"
 
-    return price, last, candles, regime, bool(last["buy"]), bool(last["sell"])
+    return price, last, c, regime, bool(last["buy_sig"]), bool(last["sell_sig"])
 
-def consider_entry(price, sig_buy, sig_sell):
-    if state["in_position"]: return
-    # spread guard
-    spr = orderbook_spread_bps()
-    if spr is not None and spr > SPREAD_GUARD_BPS:
-        cprint(f"⏸ Spread high {spr:.2f}bps > {SPREAD_GUARD_BPS}bps — wait", "yellow")
-        return
-    if sig_buy:  open_position("long",  price)
-    elif sig_sell: open_position("short", price)
-
-def manage_position(df, price, last, candles):
+# ---------- manage ----------
+def manage_position(df, price, last):
     if not state["in_position"]: return
     side, entry, qty = state["side"], state["entry"], state["qty"]
-    atrv = float(df["atr"].iloc[-1]); adxv = float(df["adx"].iloc[-1]); rsi_v = float(df["rsi"].iloc[-1])
+    atrv = last["atr"]; adxv = last["adx"]
 
-    gain = pct(entry, price) if side=="long" else pct(price, entry)
-    gain_pct = gain*100
+    gain = (pct(entry, price) if side=="long" else pct(price, entry))*100
 
-    # --- TP1 ---
-    if (not state["tp1_done"]) and gain_pct >= TP1_PCT*100 and qty>0:
+    # TP1
+    if not state["tp1_done"] and gain>=TP1_PCT*100 and qty>0:
         cut = max(qty*TP1_CLOSE_FRAC, 0.0)
-        if cut>0:
-            # partial close reduceOnly
-            order_side = "sell" if side=="long" else "buy"
-            pos_side = pos_side_for_close(side)
-            resp = market_order(order_side, cut, reduce=True, position_side=pos_side)
-            if order_success(resp):
-                state["qty"] = max(0.0, qty - cut)
-                state["tp1_done"] = True
-                save_state()
-                cprint(f"🎯 TP1 → closed {nice(cut)} remain={nice(state['qty'])}", "cyan")
+        resp = place_market("sell" if side=="long" else "buy", cut, reduce_only=True)
+        if resp.get("status")=="ok":
+            state["qty"] -= cut
+            state["tp1_done"] = True
+            save_state()
+            cprint(f"🎯 TP1 hit – closed {nice(cut)} remain {nice(state['qty'])}", "cyan")
 
-    # --- ATR Trailing ---
-    if atrv>0 and (gain_pct>=TRAIL_ACTIVATE_PCT*100 or (adxv>=28 and state["tp1_done"])):
-        dist = ATR_MULT_TRAIL * atrv
-        if side=="long":
-            trail = max(entry, price - dist)
-            if last["low"] <= trail:
-                cprint("🏁 ATR trail exit LONG", "yellow"); close_full(); return
-        else:
-            trail = min(entry, price + dist)
-            if last["high"] >= trail:
-                cprint("🏁 ATR trail exit SHORT", "yellow"); close_full(); return
+    # Breakeven (منطق حماية داخلي)
+    if gain>=BREAKEVEN_AFTER_PCT*100:
+        pass  # (لا نرسل أمر تعديل؛ نكتفي بمنطق الخروج)
 
-    # --- Giveback after TP1 / minimal profit ---
-    if (state["tp1_done"] or gain_pct>=MIN_TP_PERCENT*100):
-        if side=="long":
-            if candles["engulf_bear"] or rsi_v>72:
-                cprint("↩️ Giveback exit LONG", "yellow"); close_full(); return
-        else:
-            if candles["engulf_bull"] or rsi_v<28:
-                cprint("↩️ Giveback exit SHORT", "yellow"); close_full(); return
+    # ATR trailing
+    if (gain>=TRAIL_ACTIVATE_PCT*100 or (HOLD_TP_STRONG and adxv>=HOLD_TP_ADX)) and atrv>0:
+        dist = ATR_MULT_TRAIL*atrv
+        if side=="long" and last["low"]< (price - dist):
+            cprint("🏁 ATR trail exit LONG", "yellow"); close_position()
+        if side=="short" and last["high"]> (price + dist):
+            cprint("🏁 ATR trail exit SHORT", "yellow"); close_position()
 
-# ===================== Logging (Clean) =====================
-logging.getLogger("werkzeug").setLevel(logging.ERROR)  # suppress HTTP 200 noise
+    # Giveback بعد TP1
+    if state["tp1_done"] and gain>=MIN_TP_PERCENT*100:
+        give = GIVEBACK_PCT
+        if side=="long" and price <= entry*(1+(gain/100 - give)):
+            cprint("↩️ Giveback exit LONG", "yellow"); close_position()
+        if side=="short" and price >= entry*(1-(gain/100 - give)):
+            cprint("↩️ Giveback exit SHORT", "yellow"); close_position()
 
-def icon(b): return "🟢" if b else "⚪"
+# ---------- entries ----------
+def consider_entry(price, sig_buy, sig_sell):
+    if state["in_position"]: return
+    # دخول مطابق لتريدنج فيو (Range Filter)
+    if sig_buy:  open_position("long",  price)
+    if sig_sell: open_position("short", price)
 
-def print_hud(df, price, candles, regime, sig_buy, sig_sell):
+# ---------- HUD logs ----------
+def hud(df, price, candles, regime, sig_buy, sig_sell):
     last = df.iloc[-1]
-    # Header
-    header = f"{SYMBOL} {INTERVAL} • {'LIVE' if (CEX_READY and LIVE_TRADING) else 'PAPER'} • {now_utc()}"
-    cprint("\n" + header, "white", "on_blue")
-    # Indicators
+    cprint(f"\n{now_utc()} | {SYMBOL} {INTERVAL} | LIVE={'ON' if LIVE_TRADING else 'OFF'} | Mode={state['mode']} | PosMode={state['position_mode']}", "white")
     print(colored("INDICATORS","cyan"))
-    print(f"  💠 Price={nice(price)}  RF={nice(last['rf'])}  hi={nice(last['high'])}  lo={nice(last['low'])}")
-    print(f"  📈 RSI({RSI_LEN})={nice(last['rsi'],2)}  +DI={nice(last['+di'],2)}  -DI={nice(last['-di'],2)}  ADX({ADX_LEN})={nice(last['adx'],2)}  ATR={nice(df['atr'].iloc[-1])}")
-    print(f"  🧭 Regime={regime}   🔔 BUY={icon(sig_buy)}  🔻 SELL={icon(sig_sell)}")
-    # Candles
+    print(f"  💠 Px={nice(price)}  RF={nice(last['rf'])}  hi={nice(last['high'])} lo={nice(last['low'])}")
+    print(f"  📈 RSI({RSI_LEN})={nice(last['rsi'])}  +DI={nice(last['+di'])}  -DI={nice(last['-di'])}  ADX({ADX_LEN})={nice(last['adx'])}")
+    print(f"  📏 ATR({ATR_LEN})={nice(last['atr'])}  spread_bps≈{SPREAD_GUARD_BPS}  Regime={regime}")
+
     print(colored("CANDLES","magenta"))
-    print(f"  Doji={icon(candles['doji'])} | EngulfBull={icon(candles['engulf_bull'])} | EngulfBear={icon(candles['engulf_bear'])}")
-    # Position
+    names=[("Doji","doji"),("PinBull","pin_bull"),("PinBear","pin_bear"),
+           ("Hammer","hammer"),("InvHammer","inv_hammer"),
+           ("Shooting","shooting"),("Gravestone","gravestone"),
+           ("EngulfBull","engulf_bull"),("EngulfBear","engulf_bear"),
+           ("TweezTop","tweezer_top"),("TweezBot","tweezer_bot"),
+           ("Piercing","piercing"),("DarkCloud","darkcloud"),
+           ("MorningStar","morning_star"),("EveningStar","evening_star"),
+           ("3Soldiers","soldiers"),("3Crows","black_crows")]
+    print("  " + " | ".join([f"{n}:{icon(candles.get(k,False))}" for n,k in names]))
+
+    print(colored("SIGNALS","yellow"))
+    print(f"  BUY={icon(sig_buy)}  SELL={icon(sig_sell)}")
+
     print(colored("POSITION","blue"))
     if state["in_position"]:
-        change = pct(state["entry"], price) if state["side"]=="long" else pct(price, state["entry"])
-        side_ico = "🟩 LONG" if state["side"]=="long" else "🟥 SHORT"
-        print(f"  {side_ico} entry={nice(state['entry'])} qty={nice(state['qty'])} Δ={nice(change*100,2)}% TP1={'✅' if state['tp1_done'] else '…'}")
+        chg = (pct(state["entry"], last['close']) if state["side"]=="long" else pct(last['close'], state["entry"])) * 100
+        print(f"  {('🟩 LONG' if state['side']=='long' else '🟥 SHORT')} entry={nice(state['entry'])} qty={nice(state['qty'])} Δ={nice(chg,2)}% tp1={icon(state['tp1_done'])}")
     else:
-        print(f"  🟨 FLAT | next_qty@{LEVERAGE}x ≈ {nice(state['next_qty_hint'])}")
-    # Results
-    eq = get_balance_usdt()
-    print(colored("RESULTS","green"))
-    print(f"  💰 Balance={nice(eq,2)} USDT | PnL(Σ)={nice(state['pnl_realized'],2)} | EffectiveEq≈{nice(eq,2)}")
+        print(f"  🟨 FLAT  next_qty≈{nice(state['next_qty_hint'])}  equity≈{nice(state['risk_equity'])} USDT")
 
-# ===================== Loop =====================
+    print(colored("RESULTS","green"))
+    print(f"  💹 RealizedPnL={nice(state['pnl_realized'])} USDT  | EffectiveEq≈{nice(state['risk_equity'])} USDT")
+
+# ---------- main loop ----------
 def strategy_loop():
     while True:
         try:
-            df = fetch_df()
-            if df is None or df.empty:
-                cprint("⚠️ No data fetched", "red")
-                time.sleep(DECISION_EVERY_S); continue
-
-            # wait for bar close if requested
-            ts = int(df["ts"].iloc[-1])
-            if USE_TV_BAR and state["last_bar_ts"] == ts:
-                # only refresh HUD
-                # recompute display-only inds for latest df
-                rf, up, lo, b, s = range_filter(df, RF_PERIOD, RF_MULT)
-                df["rf"]=rf; df["atr"]=atr(df, ATR_LEN)
-                pdi,mdi,adx = dx_plus_minus(df, ADX_LEN)
-                df["+di"]=pdi; df["-di"]=mdi; df["adx"]=adx; df["rsi"]=rsi(df["close"],RSI_LEN)
-                price = df["close"].iloc[-1]
-                candles={"doji":False,"engulf_bull":False,"engulf_bear":False}
-                print_hud(df, price, candles, "—", bool(b.iloc[-1]), bool(s.iloc[-1]))
-                time.sleep(DECISION_EVERY_S); continue
-            state["last_bar_ts"] = ts
-
+            ohlc = fetch_ohlcv(SYMBOL, INTERVAL, limit=300)
+            if not ohlc: 
+                cprint("⚠️ no data", "red"); time.sleep(DECISION_EVERY_S); continue
+            df = df_from_ohlc(ohlc)
             price, last, candles, regime, sig_buy, sig_sell = decide(df)
-            manage_position(df, price, last, candles)
+
+            # لو USE_TV_BAR=TRUE انتظر إغلاق شمعة جديدة
+            if USE_TV_BAR:
+                ts = df.iloc[-1]["ts"]
+                if state["last_close_ts"] == ts:
+                    time.sleep(DECISION_EVERY_S); continue
+                state["last_close_ts"] = ts
+
+            # إدارة و دخول
+            manage_position(df, price, last)
             consider_entry(price, sig_buy, sig_sell)
-            print_hud(df, price, candles, regime, sig_buy, sig_sell)
+
+            # HUD
+            hud(df, price, candles, regime, sig_buy, sig_sell)
 
         except Exception as e:
-            cprint(f"❌ loop error: {e}", "red")
-            print(traceback.format_exc())
+            cprint(f"❌ loop err: {e}\n{traceback.format_exc()}", "red")
         time.sleep(DECISION_EVERY_S)
 
-# ===================== Flask =====================
-from flask import Flask, jsonify
+# ---------- Flask / keepalive ----------
+from flask import Flask
+import requests
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return jsonify({
-        "ts": now_utc(),
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "live": (CEX_READY and LIVE_TRADING),
-        "position_mode": BINGX_POSITION_MODE,
-        "equity": state["equity"],
-        "pnl_sum": state["pnl_realized"],
-        "in_position": state["in_position"],
-        "side": state["side"],
-        "entry": state["entry"],
-        "qty": state["qty"]
-    })
+@app.get("/")
+def root():
+    return f"OK • {SYMBOL} • {INTERVAL} • LIVE={'ON' if LIVE_TRADING else 'OFF'} • {now_utc()}"
 
-@app.route("/metrics")
+@app.get("/metrics")
 def metrics():
-    return jsonify({"state": state})
+    return jsonify({"ts":now_utc(),"symbol":SYMBOL,"interval":INTERVAL,"state":state})
 
 def keepalive():
     if not SELF_URL: return
+    n=0
     while True:
         try:
-            r = requests.get(SELF_URL, timeout=5)
-            # 2-line heartbeat only:
-            cprint(f"🛰 keepalive {r.status_code} • {now_utc()}", "white")
-            cprint(f"URL: {SELF_URL}", "white")
-        except Exception as e:
-            cprint(f"🛰 keepalive error: {e}", "yellow")
+            requests.get(SELF_URL, timeout=4)
+            # اطبع سطرين فقط في الدقيقة
+            n=(n+1)%PING_LOG_EVERY_N
+            if n==0:
+                cprint(f"keepalive ok (200) • URL: {SELF_URL}", "white")
+        except: pass
         time.sleep(KEEPALIVE_SECONDS)
 
-# ===================== Start =====================
-if __name__ == "__main__":
-    mode = "LIVE" if (CEX_READY and LIVE_TRADING) else "PAPER"
-    cprint(f"🚀 Starting SMART BOT • {SYMBOL} • MODE={mode}", "white", "on_blue")
-    try:
-        apply_position_mode()
-        set_leverage()
-    except: pass
+# ---------- start ----------
+if __name__=="__main__":
+    cprint(f"Starting SMART BOT  •  {SYMBOL}  •  MODE={'LIVE' if LIVE_TRADING else 'PAPER'}", "white","on_blue")
+    cprint(f"PositionMode = {BINGX_POSITION_MODE.upper()}", "cyan")
+    if ex:
+        try: set_leverage(LEVERAGE)
+        except Exception as e: cprint(f"set_leverage warn: {e}", "yellow")
     threading.Thread(target=strategy_loop, daemon=True).start()
     if SELF_URL:
         threading.Thread(target=keepalive, daemon=True).start()
